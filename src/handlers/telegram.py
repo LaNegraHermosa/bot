@@ -1,8 +1,11 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from ..config import settings
 from ..services.database import DatabaseService
 from ..services.cart import cart_service
+from ..models import OrderItem
+
+logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -63,7 +66,22 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     message = f"*{product.name}*\n\n{product.description}\n\n💰 Precio: ${product.price}\n📦 Stock: {product.stock}"
-    await update.callback_query.edit_message_text(message, reply_markup=reply_markup, parse_mode="Markdown")
+    
+    if product.image_url:
+        try:
+            await update.callback_query.edit_message_media(
+                media=telegram.InputMediaPhoto(
+                    media=product.image_url,
+                    caption=message,
+                    parse_mode="Markdown"
+                ),
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo enviar imagen: {e}")
+            await update.callback_query.edit_message_text(message, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.callback_query.edit_message_text(message, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -114,20 +132,17 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("El carrito está vacío", show_alert=True)
         return
     
-    # Obtener o crear cliente
     customer = DatabaseService.get_or_create_customer(telegram_id=user_id, name=f"Cliente_{user_id}")
-    
-    # Calcular total
     total = cart_service.calculate_total(user_id)
     
-    # Crear orden
     order = DatabaseService.create_order(customer_id=customer.id, total=total)
     
-    # Agregar items a la orden
-    order_items = [
-        {"product_id": item.product_id, "quantity": item.quantity, "price": item.price}
+    # Guardar items en DB
+    items_to_save = [
+        OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, price=item.price)
         for item in cart
     ]
+    DatabaseService.add_order_items(order.id, items_to_save)
     
     # Actualizar stock
     for item in cart:
@@ -136,6 +151,8 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             DatabaseService.update_stock(item.product_id, prod.stock - item.quantity)
     
     cart_service.clear_cart(user_id)
+    
+    logger.info(f"Pedido #{order.id} creado por {customer.name} (${total})")
     
     await update.callback_query.edit_message_text(
         f"✅ **Pedido #{order.id} creado exitosamente!**\n\n"

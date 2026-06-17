@@ -1,4 +1,5 @@
 from typing import List, Optional
+from datetime import datetime
 from ..database import supabase_client
 from ..models import Product, Customer, Order, OrderItem
 
@@ -11,6 +12,7 @@ class DatabaseService:
             query = query.eq("active", True)
         if category:
             query = query.eq("category", category)
+        query = query.order("id")
         response = query.execute()
         return [Product(**p) for p in response.data]
     
@@ -54,6 +56,13 @@ class DatabaseService:
         response = supabase_client.table("customers").insert(customer_data).execute()
         return Customer(**response.data[0])
     
+    @staticmethod
+    def get_customer_by_id(customer_id: int) -> Optional[Customer]:
+        response = supabase_client.table("customers").select("*").eq("id", customer_id).execute()
+        if response.data:
+            return Customer(**response.data[0])
+        return None
+    
     # ORDENES
     @staticmethod
     def create_order(customer_id: int, total: float, notes: Optional[str] = None) -> Order:
@@ -78,3 +87,38 @@ class DatabaseService:
         if response.data:
             return Order(**response.data[0])
         return None
+    
+    @staticmethod
+    def update_order_status(order_id: int, status: str) -> bool:
+        response = supabase_client.table("orders").update({
+            "status": status,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", order_id).execute()
+        return len(response.data) > 0
+    
+    # ADMIN
+    @staticmethod
+    def get_all_orders() -> list:
+        response = supabase_client.table("orders").select("*").order("id", desc=True).limit(50).execute()
+        orders = response.data
+        for o in orders:
+            customer = supabase_client.table("customers").select("name").eq("id", o["customer_id"]).execute()
+            o["customer_name"] = customer.data[0]["name"] if customer.data else "—"
+        return orders
+    
+    @staticmethod
+    def get_admin_stats() -> dict:
+        orders = supabase_client.table("orders").select("*").execute()
+        customers = supabase_client.table("customers").select("id", count="exact").execute()
+        products = supabase_client.table("products").select("id", count="exact").execute()
+        
+        total_revenue = sum(o.get("total", 0) for o in orders.data if o.get("status") != "cancelled")
+        pending = sum(1 for o in orders.data if o.get("status") == "pending")
+        
+        return {
+            "total_orders": len(orders.data),
+            "pending_orders": pending,
+            "total_customers": customers.count if hasattr(customers, 'count') else len(customers.data),
+            "total_products": products.count if hasattr(products, 'count') else len(products.data),
+            "total_revenue": round(total_revenue, 2),
+        }

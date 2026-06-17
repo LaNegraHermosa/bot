@@ -1,8 +1,10 @@
-from twilio.twiml.messaging_response import MessagingResponse
-from fastapi import Request, Response
-from typing import Dict, List
+import logging
+from typing import Dict
 from ..services.database import DatabaseService
 from ..services.cart import cart_service
+from ..models import OrderItem
+
+logger = logging.getLogger(__name__)
 
 class WhatsAppHandler:
     def __init__(self):
@@ -99,8 +101,14 @@ class WhatsAppHandler:
         
         total = cart_service.calculate_total(customer.id)
         
-        # Crear orden
         order = DatabaseService.create_order(customer_id=customer.id, total=total)
+        
+        # Guardar items en DB
+        items_to_save = [
+            OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, price=item.price)
+            for item in cart
+        ]
+        DatabaseService.add_order_items(order.id, items_to_save)
         
         # Actualizar stock
         for item in cart:
@@ -109,6 +117,8 @@ class WhatsAppHandler:
                 DatabaseService.update_stock(item.product_id, prod.stock - item.quantity)
         
         cart_service.clear_cart(customer.id)
+        
+        logger.info(f"Pedido #{order.id} creado vía WhatsApp ({customer.name}) - ${total}")
         
         return f"✅ *¡Pedido #{order.id} creado!*\n\n" \
                f"Total: ${total}\n" \
