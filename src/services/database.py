@@ -1,13 +1,16 @@
 from typing import List, Optional
 from datetime import datetime
-from ..database import supabase_client
 from ..models import Product, Customer, Order, OrderItem
+
+def _get_client():
+    from ..database import get_supabase_client
+    return get_supabase_client()
 
 class DatabaseService:
     # PRODUCTOS
     @staticmethod
     def get_products(category: Optional[str] = None, active_only: bool = True) -> List[Product]:
-        query = supabase_client.table("products").select("*")
+        query = _get_client().table("products").select("*")
         if active_only:
             query = query.eq("active", True)
         if category:
@@ -18,25 +21,47 @@ class DatabaseService:
     
     @staticmethod
     def get_product(product_id: int) -> Optional[Product]:
-        response = supabase_client.table("products").select("*").eq("id", product_id).execute()
+        response = _get_client().table("products").select("*").eq("id", product_id).execute()
         if response.data:
             return Product(**response.data[0])
         return None
     
     @staticmethod
     def create_product(product: Product) -> Product:
-        response = supabase_client.table("products").insert(product.model_dump(exclude={"id"})).execute()
+        response = _get_client().table("products").insert(product.model_dump(exclude={"id"})).execute()
         return Product(**response.data[0])
     
     @staticmethod
     def update_stock(product_id: int, new_stock: int) -> bool:
-        response = supabase_client.table("products").update({"stock": new_stock}).eq("id", product_id).execute()
+        response = _get_client().table("products").update({"stock": new_stock}).eq("id", product_id).execute()
         return len(response.data) > 0
+    
+    @staticmethod
+    def get_customer_orders(customer_id: int) -> list:
+        response = _get_client().table("orders").select("*").eq("customer_id", customer_id).order("id", desc=True).execute()
+        return response.data if response.data else []
+    
+    @staticmethod
+    def atomic_decrement_stock(product_id: int, quantity: int) -> bool:
+        try:
+            client = _get_client()
+            # Get current stock
+            product_resp = client.table("products").select("stock").eq("id", product_id).execute()
+            if not product_resp.data:
+                return False
+            current_stock = product_resp.data[0]["stock"]
+            if current_stock < quantity:
+                return False
+            # Update with condition to prevent race condition
+            result = client.table("products").update({"stock": current_stock - quantity}).eq("id", product_id).eq("stock", current_stock).execute()
+            return len(result.data) > 0
+        except Exception:
+            return False
     
     # CLIENTES
     @staticmethod
     def get_or_create_customer(telegram_id: Optional[int] = None, phone: Optional[str] = None, name: str = "") -> Customer:
-        query = supabase_client.table("customers").select("*")
+        query = _get_client().table("customers").select("*")
         if telegram_id:
             query = query.eq("telegram_id", telegram_id)
         elif phone:
@@ -46,19 +71,18 @@ class DatabaseService:
         if response.data:
             return Customer(**response.data[0])
         
-        # Crear nuevo cliente
         customer_data = {"name": name}
         if telegram_id:
             customer_data["telegram_id"] = telegram_id
         if phone:
             customer_data["phone"] = phone
             
-        response = supabase_client.table("customers").insert(customer_data).execute()
+        response = _get_client().table("customers").insert(customer_data).execute()
         return Customer(**response.data[0])
     
     @staticmethod
     def get_customer_by_id(customer_id: int) -> Optional[Customer]:
-        response = supabase_client.table("customers").select("*").eq("id", customer_id).execute()
+        response = _get_client().table("customers").select("*").eq("id", customer_id).execute()
         if response.data:
             return Customer(**response.data[0])
         return None
@@ -72,25 +96,25 @@ class DatabaseService:
             "status": "pending",
             "notes": notes
         }
-        response = supabase_client.table("orders").insert(order_data).execute()
+        response = _get_client().table("orders").insert(order_data).execute()
         return Order(**response.data[0])
     
     @staticmethod
     def add_order_items(order_id: int, items: List[OrderItem]) -> List[OrderItem]:
         items_data = [item.model_dump(exclude={"id"}) for item in items]
-        response = supabase_client.table("order_items").insert(items_data).execute()
+        response = _get_client().table("order_items").insert(items_data).execute()
         return [OrderItem(**item) for item in response.data]
     
     @staticmethod
     def get_order(order_id: int) -> Optional[Order]:
-        response = supabase_client.table("orders").select("*").eq("id", order_id).execute()
+        response = _get_client().table("orders").select("*").eq("id", order_id).execute()
         if response.data:
             return Order(**response.data[0])
         return None
     
     @staticmethod
     def update_order_status(order_id: int, status: str) -> bool:
-        response = supabase_client.table("orders").update({
+        response = _get_client().table("orders").update({
             "status": status,
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", order_id).execute()
@@ -99,18 +123,18 @@ class DatabaseService:
     # ADMIN
     @staticmethod
     def get_all_orders() -> list:
-        response = supabase_client.table("orders").select("*").order("id", desc=True).limit(50).execute()
+        response = _get_client().table("orders").select("*").order("id", desc=True).limit(50).execute()
         orders = response.data
         for o in orders:
-            customer = supabase_client.table("customers").select("name").eq("id", o["customer_id"]).execute()
+            customer = _get_client().table("customers").select("name").eq("id", o["customer_id"]).execute()
             o["customer_name"] = customer.data[0]["name"] if customer.data else "—"
         return orders
     
     @staticmethod
     def get_admin_stats() -> dict:
-        orders = supabase_client.table("orders").select("*").execute()
-        customers = supabase_client.table("customers").select("id", count="exact").execute()
-        products = supabase_client.table("products").select("id", count="exact").execute()
+        orders = _get_client().table("orders").select("*").execute()
+        customers = _get_client().table("customers").select("id", count="exact").execute()
+        products = _get_client().table("products").select("id", count="exact").execute()
         
         total_revenue = sum(o.get("total", 0) for o in orders.data if o.get("status") != "cancelled")
         pending = sum(1 for o in orders.data if o.get("status") == "pending")

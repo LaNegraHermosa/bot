@@ -1,21 +1,42 @@
+import os
 from fastapi import FastAPI, Request, Response, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from pydantic import BaseModel
 from typing import Optional
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import secrets
+from fastapi import Depends
 
 from .handlers.whatsapp import whatsapp_handler
 from .config import settings
 
+security = HTTPBasic()
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, os.getenv("ADMIN_USER", "admin"))
+    correct_password = secrets.compare_digest(credentials.password, os.getenv("ADMIN_PASSWORD", "changeme"))
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
+
 app = FastAPI(title="Bot Multi-plataforma")
 
-# CORS para web
+# CORS restringido a orígenes configurados
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
+if not CORS_ORIGINS or CORS_ORIGINS == [""]:
+    CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -28,32 +49,43 @@ class WebMessage(BaseModel):
 # Endpoint para WhatsApp/Twilio
 @app.post("/whatsapp/webhook")
 async def whatsapp_webhook(request: Request):
-    form = await request.form()
-    phone = form.get("From", "").replace("whatsapp:", "")
-    message = form.get("Body", "")
-    
-    response_text = await whatsapp_handler.handle_message(phone, message)
-    
-    twiml = MessagingResponse()
-    twiml.message(response_text)
-    
-    return Response(content=str(twiml), media_type="application/xml")
+    try:
+        form = await request.form()
+        phone = form.get("From", "").replace("whatsapp:", "")
+        message = form.get("Body", "")
+        
+        response_text = await whatsapp_handler.handle_message(phone, message)
+        
+        twiml = MessagingResponse()
+        twiml.message(response_text)
+        
+        return Response(content=str(twiml), media_type="application/xml")
+    except Exception:
+        twiml = MessagingResponse()
+        twiml.message("Error interno. Intente más tarde.")
+        return Response(content=str(twiml), media_type="application/xml")
 
 # Endpoint para chat web
 @app.post("/web/chat")
 async def web_chat(message_data: WebMessage):
-    response_text = await whatsapp_handler.handle_message(
-        message_data.user_id, 
-        message_data.message
-    )
-    return {"response": response_text}
+    try:
+        response_text = await whatsapp_handler.handle_message(
+            message_data.user_id, 
+            message_data.message
+        )
+        return {"response": response_text}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Error al procesar mensaje")
 
 # Endpoint para obtener productos (API pública)
 @app.get("/api/products")
 async def get_products(category: Optional[str] = None):
-    from .services.database import DatabaseService
-    products = DatabaseService.get_products(category=category)
-    return [p.model_dump() for p in products]
+    try:
+        from .services.database import DatabaseService
+        products = DatabaseService.get_products(category=category)
+        return [p.model_dump() for p in products]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Error al obtener productos")
 
 # ============================================
 # Admin Dashboard (HTML)
@@ -228,27 +260,32 @@ ADMIN_HTML = """
 """
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_dashboard():
+async def admin_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
+    verify_admin(credentials)
     return ADMIN_HTML
 
 # Admin API endpoints
 @app.get("/admin/api/stats")
-async def admin_stats():
+async def admin_stats(credentials: HTTPBasicCredentials = Depends(security)):
+    verify_admin(credentials)
     from .services.database import DatabaseService
     return DatabaseService.get_admin_stats()
 
 @app.get("/admin/api/orders")
-async def admin_orders():
+async def admin_orders(credentials: HTTPBasicCredentials = Depends(security)):
+    verify_admin(credentials)
     from .services.database import DatabaseService
     return DatabaseService.get_all_orders()
 
 @app.get("/admin/api/products")
-async def admin_products():
+async def admin_products(credentials: HTTPBasicCredentials = Depends(security)):
+    verify_admin(credentials)
     from .services.database import DatabaseService
     return [p.model_dump() for p in DatabaseService.get_products(active_only=False)]
 
 @app.patch("/admin/api/orders/{order_id}/status")
-async def admin_update_order_status(order_id: int, data: dict):
+async def admin_update_order_status(order_id: int, data: dict, credentials: HTTPBasicCredentials = Depends(security)):
+    verify_admin(credentials)
     from .services.database import DatabaseService
     status = data.get("status")
     if status not in ("pending", "confirmed", "preparing", "ready", "delivered", "cancelled"):
