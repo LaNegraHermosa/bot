@@ -19,9 +19,12 @@ class Settings:
     ADMIN_USER: str = os.getenv("ADMIN_USER", "")
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
 
-    cors_raw: str = os.getenv("CORS_ORIGINS", "http://localhost:8000")
-    CORS_ORIGINS: list = [o.strip() for o in cors_raw.split(",") if o.strip()]
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    PORT: int = int(os.getenv("PORT", "8000"))
 
     ENV: str = os.getenv("ENV", "development")
+
+    cors_raw: str = os.getenv("CORS_ORIGINS", "http://localhost:8000")
+    CORS_ORIGINS: list = [o.strip() for o in cors_raw.split(",") if o.strip()]
 
 settings = Settings()

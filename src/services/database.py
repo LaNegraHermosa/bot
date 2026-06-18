@@ -150,12 +150,11 @@ class DatabaseService:
 
     @staticmethod
     def get_all_orders() -> list:
-        resp = _db().table("orders").select("*").order("id", desc=True).limit(50).execute()
-        orders = resp.data
-        for o in orders:
-            c = _db().table("customers").select("name").eq("id", o["customer_id"]).execute()
-            o["customer_name"] = c.data[0]["name"] if c.data else "—"
-        return orders
+        resp = _db().table("orders").select("id, customer_id, total, status, created_at, customers(name)") \
+            .order("id", desc=True).limit(50).execute()
+        for o in resp.data:
+            o["customer_name"] = o.pop("customers", {}).get("name", "—") if o.get("customers") else "—"
+        return resp.data
 
     @staticmethod
     def get_admin_stats() -> dict:

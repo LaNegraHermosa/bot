@@ -1,38 +1,36 @@
-import os
-import hashlib
-from fastapi import FastAPI, Request, Response, HTTPException, Query, Depends
+import bcrypt
+import secrets
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import secrets
 
 from .config import settings
 
 security = HTTPBasic()
 
+_ADMIN_PASSWORD_HASH = bcrypt.hashpw(settings.ADMIN_PASSWORD.encode(), bcrypt.gensalt()) if settings.ADMIN_PASSWORD else b""
+
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if not settings.ADMIN_USER or not settings.ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="Admin not configured. Set ADMIN_USER and ADMIN_PASSWORD env vars.")
     user_ok = secrets.compare_digest(credentials.username, settings.ADMIN_USER)
-    pass_ok = secrets.compare_digest(
-        hashlib.sha256(credentials.password.encode()).hexdigest(),
-        hashlib.sha256(settings.ADMIN_PASSWORD.encode()).hexdigest()
-    )
+    pass_ok = bcrypt.checkpw(credentials.password.encode(), _ADMIN_PASSWORD_HASH)
     if not (user_ok and pass_ok):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-app = FastAPI(title="Bot Tienda")
+docs_enabled = settings.ENV == "development"
+app = FastAPI(title="Bot Tienda", docs_url="/docs" if docs_enabled else None, redoc_url="/redoc" if docs_enabled else None)
 
-CORS_ORIGINS = settings.CORS_ORIGINS or ["http://localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 class WebMessage(BaseModel):
@@ -151,28 +149,24 @@ loadData();setInterval(loadData,30000);
 </html>"""
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_dashboard(_: HTTPBasicCredentials = Depends(security)):
-    verify_admin(_)
+async def admin_dashboard(_=Depends(verify_admin)):
     return ADMIN_HTML
 
 @app.get("/admin/api/stats")
-async def admin_stats(_: HTTPBasicCredentials = Depends(security)):
-    verify_admin(_)
+async def admin_stats(_=Depends(verify_admin)):
     from .services.database import DatabaseService
     return DatabaseService.get_admin_stats()
 
 @app.get("/admin/api/orders")
-async def admin_orders(_: HTTPBasicCredentials = Depends(security)):
-    verify_admin(_)
+async def admin_orders(_=Depends(verify_admin)):
     from .services.database import DatabaseService
     return DatabaseService.get_all_orders()
 
 @app.get("/admin/api/products")
-async def admin_products(_: HTTPBasicCredentials = Depends(security)):
-    verify_admin(_)
+async def admin_products(_=Depends(verify_admin)):
     from .services.database import DatabaseService
     return [p.model_dump() for p in DatabaseService.get_products(active_only=False)]
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT)

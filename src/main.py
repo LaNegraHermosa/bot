@@ -24,8 +24,8 @@ async def run_telegram():
 
 
 async def run_api():
-    logger.info("API iniciada en http://0.0.0.0:8000")
-    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
+    logger.info("API iniciada en http://%s:%s", settings.HOST, settings.PORT)
+    config = uvicorn.Config(fastapi_app, host=settings.HOST, port=settings.PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 

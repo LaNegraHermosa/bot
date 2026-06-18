@@ -7,9 +7,6 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 class WhatsAppHandler:
-    def __init__(self):
-        self.user_states: dict = {}
-
     def _resolve_customer(self, phone: str) -> int:
         c = DatabaseService.get_or_create_customer(phone=phone, name="Cliente WhatsApp")
         return c.id
@@ -55,7 +52,11 @@ class WhatsAppHandler:
             return "❌ Producto no encontrado."
         if product.stock < 1:
             return "❌ Producto sin stock."
-        customer_id = self._resolve_customer(phone)
+        try:
+            customer_id = self._resolve_customer(phone)
+        except Exception as e:
+            logger.error(f"Error al resolver cliente: {e}")
+            return "❌ Error al identificar usuario."
         try:
             cart_service.add_to_cart(customer_id, pid, 1)
             return f"✅ *{product.name}* agregado.\nUsa *carrito* para ver."
@@ -76,18 +77,25 @@ class WhatsAppHandler:
         return msg + f"\n\n💵 *Total: ${total}*\n\nResponde *confirmar*"
 
     async def _checkout(self, phone: str) -> str:
-        customer_id = self._resolve_customer(phone)
+        try:
+            customer_id = self._resolve_customer(phone)
+        except Exception as e:
+            logger.error(f"Error al resolver cliente: {e}")
+            return "❌ Error al identificar usuario."
         cart = cart_service.get_cart(customer_id)
         if not cart:
             return "🛒 Carrito vacío."
         try:
+            for i in cart:
+                product = DatabaseService.get_product(i.product_id)
+                if not product or product.stock < i.quantity:
+                    return f"❌ Stock insuficiente para *{i.product_name}*."
             total = cart_service.calculate_total(customer_id)
             order = DatabaseService.create_order(customer_id=customer_id, total=total)
             items = [OrderItem(order_id=order.id, product_id=i.product_id, quantity=i.quantity, price=i.price) for i in cart]
             DatabaseService.add_order_items(order.id, items)
             for i in cart:
-                if not DatabaseService.atomic_decrement_stock(i.product_id, i.quantity):
-                    logger.warning(f"Stock insuficiente #{order.id} producto {i.product_id}")
+                DatabaseService.atomic_decrement_stock(i.product_id, i.quantity)
             cart_service.clear_cart(customer_id)
             logger.info(f"Pedido #{order.id} WhatsApp ${total}")
             return f"✅ *Pedido #{order.id} creado!*\nTotal: ${total}\nNos pondremos en contacto."

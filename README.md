@@ -1,139 +1,104 @@
 # Bot Multi-plataforma para Negocio
 
-🤖 Bot automatizado para gestión de pedidos y ventas en múltiples plataformas.
+Bot automatizado para gestión de pedidos y ventas en Telegram, WhatsApp (Twilio opcional) y Web.
 
 ## Características
 
-- **Multi-plataforma**: Telegram, WhatsApp (Twilio) y Web
+- **Multi-plataforma**: Telegram, WhatsApp (Twilio opcional) y Web
 - **Gestión de productos**: Catálogo con imágenes, precios y stock
-- **Carrito de compras**: Agregar, ver y confirmar pedidos
-- **Base de datos Supabase**: Integración completa con PostgreSQL
-- **API REST**: Endpoints para chat web y gestión de productos
+- **Carrito persistente en DB**: Tabla `carts` en PostgreSQL, no en memoria
+- **Stock atómico**: `SELECT FOR UPDATE` vía RPC `atomic_decrement_stop`
+- **Dashboard admin**: Panel web en `/admin` con stats, órdenes y productos
+- **Admin auth**: HTTP Basic con bcrypt
+- **API REST**: Endpoints públicos y admin
 
-## Estructura del Proyecto
+## Estructura
 
 ```
 src/
-├── api.py           # FastAPI para WhatsApp webhook y chat web
-├── config.py        # Configuración y variables de entorno
-├── database.py      # Conexión a Supabase
-├── main.py          # Punto de entrada para Telegram bot
+├── api.py           # FastAPI: webhook WhatsApp, chat web, /admin, /api
+├── config.py        # Variables de entorno (Settings)
+├── database.py      # Conexión lazy a Supabase
+├── main.py          # Entrypoint: Telegram bot + FastAPI concurrente
 ├── handlers/
-│   ├── telegram.py  # Handlers para Telegram
-│   └── whatsapp.py  # Handlers para WhatsApp
+│   ├── telegram.py  # Handlers Telegram
+│   └── whatsapp.py  # Handlers WhatsApp
 ├── models/
-│   └── __init__.py  # Modelos Pydantic (Product, Customer, Order)
+│   └── __init__.py  # Pydantic: Product, Customer, Order, OrderItem, CartItem
 └── services/
-    ├── database.py  # Operaciones de base de datos
-    └── cart.py      # Lógica del carrito de compras
+    ├── database.py  # CRUD a Supabase (productos, clientes, carrito, órdenes)
+    └── cart.py      # Lógica de carrito (delega a DatabaseService)
 ```
 
 ## Instalación
 
-1. **Instalar dependencias**:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. **Configurar variables de entorno** (`.env`):
-```bash
-# Telegram
-TELEGRAM_BOT_TOKEN=tu_token_de_botfather
+## Variables de entorno (`.env`)
 
-# Supabase
+```
+TELEGRAM_BOT_TOKEN=tu_token
+
 SUPABASE_URL=https://tu-proyecto.supabase.co
-SUPABASE_ANON_KEY=tu_anon_key
 SUPABASE_SERVICE_KEY=tu_service_key
 
-# Twilio (WhatsApp)
-TWILIO_ACCOUNT_SID=tu_account_sid
-TWILIO_AUTH_TOKEN=tu_auth_token
-TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
+ADMIN_USER=admin
+ADMIN_PASSWORD=clave-segura
+
+HOST=0.0.0.0
+PORT=8000
+ENV=development
+
+CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+
+# Opcionales (solo si usas Twilio)
+# TWILIO_ACCOUNT_SID=
+# TWILIO_AUTH_TOKEN=
+# TWILIO_WHATSAPP_NUMBER=
 ```
 
 ## Configuración de Supabase
 
-Crear las siguientes tablas en tu proyecto Supabase:
+Ejecutar `supabase_migration.sql` en tu proyecto Supabase (SQL Editor). Crea:
 
-### products
-| column | type |
-|--------|------|
-| id | bigint (auto) |
-| name | text |
-| description | text |
-| price | numeric |
-| stock | int |
-| category | text |
-| image_url | text |
-| active | boolean |
+- `products`, `customers`, `orders`, `order_items`, `carts`
+- Índices y triggers `updated_at`
+- Función RPC `atomic_decrement_stock` con `FOR UPDATE`
 
-### customers
-| column | type |
-|--------|------|
-| id | bigint (auto) |
-| telegram_id | bigint |
-| phone | text |
-| name | text |
-| email | text |
-
-### orders
-| column | type |
-|--------|------|
-| id | bigint (auto) |
-| customer_id | bigint |
-| total | numeric |
-| status | text |
-| notes | text |
-
-### order_items
-| column | type |
-|--------|------|
-| id | bigint (auto) |
-| order_id | bigint |
-| product_id | bigint |
-| quantity | int |
-| price | numeric |
+Poblar datos de ejemplo:
+```bash
+python seed.py
+```
 
 ## Uso
 
-### Ejecutar Bot de Telegram:
 ```bash
 python src/main.py
 ```
 
-### Ejecutar API (WhatsApp + Web):
-```bash
-uvicorn src.api:app --reload
-```
+Inicia el bot de Telegram y la API concurrentemente.
 
-### Endpoints disponibles:
-- `POST /whatsapp/webhook` - Webhook para Twilio WhatsApp
-- `POST /web/chat` - API para chat web
-- `GET /api/products` - Lista de productos (pública)
+### Endpoints
 
-## Funcionalidades
+| Ruta | Auth | Descripción |
+|------|------|-------------|
+| `GET /api/products` | No | Catálogo público |
+| `POST /web/chat` | No | Chat web (usa WhatsAppHandler) |
+| `POST /whatsapp/webhook` | No | Webhook Twilio (solo si configurado) |
+| `GET /admin` | Basic | Dashboard admin |
+| `GET /admin/api/stats` | Basic | Stats (órdenes, clientes, ingresos) |
+| `GET /admin/api/orders` | Basic | Lista de órdenes |
+| `GET /admin/api/products` | Basic | Lista de productos (incluye inactivos) |
 
-### Para Clientes:
-- Ver catálogo de productos
-- Agregar productos al carrito
-- Ver total del carrito
-- Confirmar pedido
-- Historial de pedidos
+## Comandos WhatsApp
 
-### Comandos de WhatsApp:
-- `hola` o `inicio` - Mensaje de bienvenida
-- `productos` - Ver catálogo
-- `carrito` - Ver carrito
-- `agregar [id]` - Agregar producto (ej: `agregar 1`)
-- `confirmar` - Finalizar pedido
-
-## Próximos pasos
-
-- [ ] Añadir imágenes de productos en Telegram
-- [ ] Implementar notificaciones de estado de pedidos
-- [ ] Integrar pasarela de pagos
-- [ ] Dashboard administrativo para ver pedidos
-- [ ] Gestión de categorías de productos
+- `hola` / `inicio` — Bienvenida
+- `productos` — Catálogo
+- `carrito` — Ver carrito
+- `agregar [id]` — Agregar producto (ej: `agregar 1`)
+- `confirmar` — Finalizar pedido
 
 ## Licencia
 

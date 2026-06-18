@@ -77,8 +77,14 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"No se pudo enviar imagen: {e}")
     await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    customer_id = _resolve_customer(update)
+async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE, customer_id: int = None):
+    if customer_id is None:
+        try:
+            customer_id = _resolve_customer(update)
+        except Exception as e:
+            logger.error(f"Error al resolver cliente: {e}")
+            await update.callback_query.edit_message_text("❌ Error al cargar tu información.")
+            return
     cart = cart_service.get_cart(customer_id)
     if not cart:
         await update.callback_query.edit_message_text(
@@ -110,7 +116,12 @@ async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if product.stock < 1:
         await update.callback_query.answer("❌ Producto sin stock disponible", show_alert=True)
         return
-    customer_id = _resolve_customer(update)
+    try:
+        customer_id = _resolve_customer(update)
+    except Exception as e:
+        logger.error(f"Error al resolver cliente: {e}")
+        await update.callback_query.answer("Error al cargar tu información", show_alert=True)
+        return
     cart = cart_service.get_cart(customer_id)
     cart_qty = sum(i.quantity for i in cart if i.product_id == product_id)
     if cart_qty + 1 > product.stock:
@@ -140,19 +151,31 @@ async def view_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text(msg + "\n\nUsa /start para volver al menú principal.")
 
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    customer_id = _resolve_customer(update)
+    try:
+        customer_id = _resolve_customer(update)
+    except Exception as e:
+        logger.error(f"Error al resolver cliente: {e}")
+        await update.callback_query.edit_message_text("❌ Error al cargar tu información.")
+        return
     cart = cart_service.get_cart(customer_id)
     if not cart:
         await update.callback_query.answer("El carrito está vacío", show_alert=True)
         return
     try:
+        for i in cart:
+            product = DatabaseService.get_product(i.product_id)
+            if not product or product.stock < i.quantity:
+                await update.callback_query.edit_message_text(
+                    f"❌ Stock insuficiente para *{i.product_name}*. Quedan {product.stock if product else 0} unidades.",
+                    parse_mode="Markdown"
+                )
+                return
         total = cart_service.calculate_total(customer_id)
         order = DatabaseService.create_order(customer_id=customer_id, total=total)
         items = [OrderItem(order_id=order.id, product_id=i.product_id, quantity=i.quantity, price=i.price) for i in cart]
         DatabaseService.add_order_items(order.id, items)
         for i in cart:
-            if not DatabaseService.atomic_decrement_stock(i.product_id, i.quantity):
-                logger.warning(f"Stock insuficiente para producto {i.product_id} en orden #{order.id}")
+            DatabaseService.atomic_decrement_stock(i.product_id, i.quantity)
         cart_service.clear_cart(customer_id)
         logger.info(f"Pedido #{order.id} creado (${total})")
         await update.callback_query.edit_message_text(
@@ -179,8 +202,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data.startswith("add_"):
         await add_to_cart(update, context)
     elif q.data == "clear_cart":
-        cart_service.clear_cart(_resolve_customer(update))
-        await view_cart(update, context)
+        try:
+            customer_id = _resolve_customer(update)
+        except Exception as e:
+            logger.error(f"Error al resolver cliente: {e}")
+            await q.edit_message_text("❌ Error al vaciar carrito.")
+            return
+        cart_service.clear_cart(customer_id)
+        await view_cart(update, context, customer_id=customer_id)
 
 def setup_telegram_handlers(app: Application):
     app.add_handler(CommandHandler("start", start))
