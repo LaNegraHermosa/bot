@@ -1,141 +1,98 @@
 import logging
-from typing import Dict
 from ..services.database import DatabaseService
 from ..services.cart import cart_service
 from ..models import OrderItem
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
 class WhatsAppHandler:
     def __init__(self):
-        self.user_states: Dict[str, str] = {}  # phone -> current_state
-    
+        self.user_states: dict = {}
+
+    def _resolve_customer(self, phone: str) -> int:
+        c = DatabaseService.get_or_create_customer(phone=phone, name="Cliente WhatsApp")
+        return c.id
+
     async def handle_message(self, phone: str, message: str) -> str:
-        message_lower = message.lower().strip()
-        
-        # Comandos básicos
-        if message_lower in ["hola", "hello", "inicio", "/start"]:
+        if not settings.WHATSAPP_ENABLED:
+            return "❌ WhatsApp desactivado. Usa Telegram."
+        ml = message.lower().strip()
+        if ml in ["hola", "hello", "inicio", "/start"]:
             return self._welcome_message()
-        
-        if message_lower in ["productos", "ver productos", "catalogo"]:
+        if ml in ["productos", "ver productos", "catalogo"]:
             return await self._list_products()
-        
-        if message_lower in ["carrito", "ver carrito", "cart"]:
+        if ml in ["carrito", "ver carrito", "cart"]:
             return await self._view_cart(phone)
-        
-        if message_lower.startswith("agregar") or message_lower.startswith("+"):
-            return await self._add_product(message_lower, phone)
-        
-        if message_lower in ["confirmar", "checkout"]:
+        if ml.startswith("agregar") or ml.startswith("+"):
+            return await self._add_product(ml, phone)
+        if ml in ["confirmar", "checkout"]:
             return await self._checkout(phone)
-        
-        return "❓ No entendí tu mensaje. Usa:\n" \
-               "*productos* - Ver catálogo\n" \
-               "*carrito* - Ver tu carrito\n" \
-               "*agregar [id]* - Agregar producto\n" \
-               "*confirmar* - Finalizar pedido"
-    
+        return "❓ No entendí. Usa: *productos*, *carrito*, *agregar [id]*, *confirmar*"
+
     def _welcome_message(self) -> str:
-        return "¡Hola! 👋 Bienvenido a nuestra tienda.\n\n" \
-               "Comandos disponibles:\n" \
-               "• *productos* - Ver catálogo\n" \
-               "• *carrito* - Ver tu carrito\n" \
-               "• *agregar [id]* - Agregar producto (ej: agregar 1)\n" \
-               "• *confirmar* - Finalizar pedido"
-    
+        return "¡Hola! Bienvenido.\n\n• *productos* - Catálogo\n• *carrito* - Tu carrito\n• *agregar [id]* - Agregar\n• *confirmar* - Finalizar"
+
     async def _list_products(self) -> str:
         try:
-            products = DatabaseService.get_products()
-        except Exception as e:
-            logger.error(f"Error al listar productos: {e}")
-            return "❌ Error al cargar productos. Intenta más tarde."
-        
-        if not products:
-            return "No hay productos disponibles en este momento."
-        
-        message = "📦 *Productos Disponibles:*\n\n"
-        for p in products[:10]:
-            message += f"*{p.id}*. {p.name} - ${p.price}\n"
-        
-        return message + "\nResponde *agregar [id]* para agregar al carrito"
-    
-    async def _add_product(self, message: str, phone: str) -> str:
+            prods = DatabaseService.get_products()
+        except Exception:
+            return "❌ Error al cargar productos."
+        if not prods:
+            return "No hay productos disponibles."
+        return "📦 *Productos:*\n\n" + "\n".join(f"*{p.id}*. {p.name} - ${p.price}" for p in prods[:10]) + "\n\nResponde *agregar [id]*"
+
+    async def _add_product(self, msg: str, phone: str) -> str:
         try:
-            parts = message.replace("+", "agregar").split()
-            product_id = int(parts[1])
+            pid = int(msg.replace("+", "agregar").split()[1])
         except (IndexError, ValueError):
-            return "❓ Formato: *agregar [id]* (ej: agregar 1)"
-        
+            return "❓ Formato: *agregar [id]*"
         try:
-            product = DatabaseService.get_product(product_id)
-            
-            if not product:
-                return "❌ Producto no encontrado"
-            
-            customer = DatabaseService.get_or_create_customer(phone=phone, name="Cliente WhatsApp")
-            cart_service.add_to_cart(customer.id, product, 1)
-            
-            return f"✅ *{product.name}* agregado al carrito\n\n" \
-                   f"Usa *carrito* para ver tu pedido"
+            product = DatabaseService.get_product(pid)
+        except Exception:
+            return "❌ Error al buscar producto."
+        if not product:
+            return "❌ Producto no encontrado."
+        if product.stock < 1:
+            return "❌ Producto sin stock."
+        customer_id = self._resolve_customer(phone)
+        try:
+            cart_service.add_to_cart(customer_id, pid, 1)
+            return f"✅ *{product.name}* agregado.\nUsa *carrito* para ver."
         except Exception as e:
-            logger.error(f"Error al agregar producto: {e}")
-            return "❌ Error al agregar producto. Intenta más tarde."
+            logger.error(f"Error al agregar: {e}")
+            return "❌ Error al agregar."
 
     async def _view_cart(self, phone: str) -> str:
         try:
-            customer = DatabaseService.get_or_create_customer(phone=phone, name="Cliente WhatsApp")
-            cart = cart_service.get_cart(customer.id)
-            
-            if not cart:
-                return "🛒 Tu carrito está vacío.\n\nUsa *productos* para ver el catálogo"
-            
-            message = "🛒 *Tu Carrito:*\n\n"
-            total = 0
-            for item in cart:
-                message += f"• {item.product_name} x{item.quantity} - ${item.subtotal}\n"
-                total += item.subtotal
-            
-            message += f"\n💵 *Total: ${total}*\n\n"
-            message += "Responde *confirmar* para finalizar el pedido"
-            
-            return message
-        except Exception as e:
-            logger.error(f"Error al ver carrito: {e}")
-            return "❌ Error al cargar carrito. Intenta más tarde."
-    
-    async def _checkout(self, phone: str) -> str:
-        try:
-            customer = DatabaseService.get_or_create_customer(phone=phone, name="Cliente WhatsApp")
-            cart = cart_service.get_cart(customer.id)
-            
-            if not cart:
-                return "🛒 Tu carrito está vacío. Usa *productos* para agregar artículos."
-            
-            total = cart_service.calculate_total(customer.id)
-            
-            order = DatabaseService.create_order(customer_id=customer.id, total=total)
-            
-            items_to_save = [
-                OrderItem(order_id=order.id, product_id=item.product_id, quantity=item.quantity, price=item.price)
-                for item in cart
-            ]
-            DatabaseService.add_order_items(order.id, items_to_save)
-            
-            for item in cart:
-                ok = DatabaseService.atomic_decrement_stock(item.product_id, item.quantity)
-                if not ok:
-                    logger.warning(f"Stock insuficiente para producto {item.product_id} en pedido #{order.id}")
-            
-            cart_service.clear_cart(customer.id)
-            
-            logger.info(f"Pedido #{order.id} creado vía WhatsApp ({customer.name}) - ${total}")
-            
-            return f"✅ *¡Pedido #{order.id} creado!*\n\n" \
-                   f"Total: ${total}\n" \
-                   "Nos pondremos en contacto contigo pronto."
-        except Exception as e:
-            logger.error(f"Error en checkout: {e}")
-            return "❌ Error al procesar pedido. Intenta más tarde."
+            customer_id = self._resolve_customer(phone)
+            cart = cart_service.get_cart(customer_id)
+        except Exception:
+            return "❌ Error al cargar carrito."
+        if not cart:
+            return "🛒 Carrito vacío. Usa *productos*."
+        total = sum(i.subtotal for i in cart)
+        msg = "🛒 *Carrito:*\n\n" + "\n".join(f"• {i.product_name} x{i.quantity} - ${i.subtotal}" for i in cart)
+        return msg + f"\n\n💵 *Total: ${total}*\n\nResponde *confirmar*"
 
-# Instancia única
+    async def _checkout(self, phone: str) -> str:
+        customer_id = self._resolve_customer(phone)
+        cart = cart_service.get_cart(customer_id)
+        if not cart:
+            return "🛒 Carrito vacío."
+        try:
+            total = cart_service.calculate_total(customer_id)
+            order = DatabaseService.create_order(customer_id=customer_id, total=total)
+            items = [OrderItem(order_id=order.id, product_id=i.product_id, quantity=i.quantity, price=i.price) for i in cart]
+            DatabaseService.add_order_items(order.id, items)
+            for i in cart:
+                if not DatabaseService.atomic_decrement_stock(i.product_id, i.quantity):
+                    logger.warning(f"Stock insuficiente #{order.id} producto {i.product_id}")
+            cart_service.clear_cart(customer_id)
+            logger.info(f"Pedido #{order.id} WhatsApp ${total}")
+            return f"✅ *Pedido #{order.id} creado!*\nTotal: ${total}\nNos pondremos en contacto."
+        except Exception as e:
+            logger.error(f"Error checkout: {e}")
+            return "❌ Error al procesar."
+
 whatsapp_handler = WhatsAppHandler()

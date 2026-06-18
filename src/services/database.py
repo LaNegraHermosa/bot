@@ -1,148 +1,173 @@
 from typing import List, Optional
-from datetime import datetime
-from ..models import Product, Customer, Order, OrderItem
+from ..database import get_supabase_client
+from ..models import Product, Customer, Order, OrderItem, CartItem
 
-def _get_client():
-    from ..database import get_supabase_client
+def _db():
     return get_supabase_client()
 
+
 class DatabaseService:
-    # PRODUCTOS
+
+    # ── PRODUCTOS ──────────────────────────────────
+
     @staticmethod
     def get_products(category: Optional[str] = None, active_only: bool = True) -> List[Product]:
-        query = _get_client().table("products").select("*")
+        query = _db().table("products").select("*")
         if active_only:
             query = query.eq("active", True)
         if category:
             query = query.eq("category", category)
         query = query.order("id")
-        response = query.execute()
-        return [Product(**p) for p in response.data]
-    
+        return [Product(**p) for p in query.execute().data]
+
     @staticmethod
     def get_product(product_id: int) -> Optional[Product]:
-        response = _get_client().table("products").select("*").eq("id", product_id).execute()
-        if response.data:
-            return Product(**response.data[0])
-        return None
-    
-    @staticmethod
-    def create_product(product: Product) -> Product:
-        response = _get_client().table("products").insert(product.model_dump(exclude={"id"})).execute()
-        return Product(**response.data[0])
-    
+        resp = _db().table("products").select("*").eq("id", product_id).execute()
+        return Product(**resp.data[0]) if resp.data else None
+
     @staticmethod
     def update_stock(product_id: int, new_stock: int) -> bool:
-        response = _get_client().table("products").update({"stock": new_stock}).eq("id", product_id).execute()
-        return len(response.data) > 0
-    
-    @staticmethod
-    def get_customer_orders(customer_id: int) -> list:
-        response = _get_client().table("orders").select("*").eq("customer_id", customer_id).order("id", desc=True).execute()
-        return response.data if response.data else []
-    
+        resp = _db().table("products").update({"stock": new_stock}).eq("id", product_id).execute()
+        return len(resp.data) > 0
+
     @staticmethod
     def atomic_decrement_stock(product_id: int, quantity: int) -> bool:
-        try:
-            client = _get_client()
-            # Get current stock
-            product_resp = client.table("products").select("stock").eq("id", product_id).execute()
-            if not product_resp.data:
-                return False
-            current_stock = product_resp.data[0]["stock"]
-            if current_stock < quantity:
-                return False
-            # Update with condition to prevent race condition
-            result = client.table("products").update({"stock": current_stock - quantity}).eq("id", product_id).eq("stock", current_stock).execute()
-            return len(result.data) > 0
-        except Exception:
-            return False
-    
-    # CLIENTES
+        resp = _db().rpc("atomic_decrement_stock", {
+            "p_product_id": product_id,
+            "p_quantity": quantity
+        }).execute()
+        return bool(resp.data)
+
+    # ── CLIENTES ───────────────────────────────────
+
     @staticmethod
     def get_or_create_customer(telegram_id: Optional[int] = None, phone: Optional[str] = None, name: str = "") -> Customer:
-        query = _get_client().table("customers").select("*")
+        query = _db().table("customers").select("*")
         if telegram_id:
             query = query.eq("telegram_id", telegram_id)
         elif phone:
             query = query.eq("phone", phone)
-        
-        response = query.execute()
-        if response.data:
-            return Customer(**response.data[0])
-        
-        customer_data = {"name": name}
+        resp = query.execute()
+        if resp.data:
+            return Customer(**resp.data[0])
+        data = {"name": name}
         if telegram_id:
-            customer_data["telegram_id"] = telegram_id
+            data["telegram_id"] = telegram_id
         if phone:
-            customer_data["phone"] = phone
-            
-        response = _get_client().table("customers").insert(customer_data).execute()
-        return Customer(**response.data[0])
-    
+            data["phone"] = phone
+        resp = _db().table("customers").insert(data).execute()
+        return Customer(**resp.data[0])
+
     @staticmethod
     def get_customer_by_id(customer_id: int) -> Optional[Customer]:
-        response = _get_client().table("customers").select("*").eq("id", customer_id).execute()
-        if response.data:
-            return Customer(**response.data[0])
-        return None
-    
-    # ORDENES
+        resp = _db().table("customers").select("*").eq("id", customer_id).execute()
+        return Customer(**resp.data[0]) if resp.data else None
+
+    # ── CARRITO (DB persistente) ───────────────────
+
+    @staticmethod
+    def get_cart_item(customer_id: int, product_id: int) -> Optional[dict]:
+        resp = _db().table("carts").select("*") \
+            .eq("customer_id", customer_id) \
+            .eq("product_id", product_id) \
+            .execute()
+        return resp.data[0] if resp.data else None
+
+    @staticmethod
+    def insert_cart_item(customer_id: int, product_id: int, quantity: int) -> None:
+        _db().table("carts").insert({
+            "customer_id": customer_id,
+            "product_id": product_id,
+            "quantity": quantity
+        }).execute()
+
+    @staticmethod
+    def update_cart_item(customer_id: int, product_id: int, quantity: int) -> None:
+        _db().table("carts").update({"quantity": quantity}) \
+            .eq("customer_id", customer_id) \
+            .eq("product_id", product_id) \
+            .execute()
+
+    @staticmethod
+    def get_cart_items(customer_id: int) -> List[CartItem]:
+        resp = _db().table("carts").select("product_id, quantity, products!inner(name, price)") \
+            .eq("customer_id", customer_id) \
+            .execute()
+        items = []
+        for row in resp.data:
+            product = row.get("products")
+            if not product:
+                continue
+            price = float(product["price"])
+            qty = row["quantity"]
+            items.append(CartItem(
+                product_id=row["product_id"],
+                quantity=qty,
+                product_name=product["name"],
+                price=price,
+                subtotal=round(price * qty, 2)
+            ))
+        return items
+
+    @staticmethod
+    def clear_cart(customer_id: int) -> None:
+        _db().table("carts").delete().eq("customer_id", customer_id).execute()
+
+    # ── ÓRDENES ────────────────────────────────────
+
     @staticmethod
     def create_order(customer_id: int, total: float, notes: Optional[str] = None) -> Order:
-        order_data = {
-            "customer_id": customer_id,
-            "total": total,
-            "status": "pending",
-            "notes": notes
-        }
-        response = _get_client().table("orders").insert(order_data).execute()
-        return Order(**response.data[0])
-    
+        data = {"customer_id": customer_id, "total": total, "status": "pending"}
+        if notes:
+            data["notes"] = notes
+        resp = _db().table("orders").insert(data).execute()
+        return Order(**resp.data[0])
+
     @staticmethod
     def add_order_items(order_id: int, items: List[OrderItem]) -> List[OrderItem]:
-        items_data = [item.model_dump(exclude={"id"}) for item in items]
-        response = _get_client().table("order_items").insert(items_data).execute()
-        return [OrderItem(**item) for item in response.data]
-    
+        data = [i.model_dump(exclude={"id"}) for i in items]
+        resp = _db().table("order_items").insert(data).execute()
+        return [OrderItem(**r) for r in resp.data]
+
     @staticmethod
     def get_order(order_id: int) -> Optional[Order]:
-        response = _get_client().table("orders").select("*").eq("id", order_id).execute()
-        if response.data:
-            return Order(**response.data[0])
-        return None
-    
+        resp = _db().table("orders").select("*").eq("id", order_id).execute()
+        return Order(**resp.data[0]) if resp.data else None
+
+    @staticmethod
+    def get_customer_orders(customer_id: int) -> list:
+        resp = _db().table("orders").select("id, total, status, created_at") \
+            .eq("customer_id", customer_id) \
+            .order("id", desc=True).limit(10).execute()
+        return resp.data or []
+
     @staticmethod
     def update_order_status(order_id: int, status: str) -> bool:
-        response = _get_client().table("orders").update({
-            "status": status,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", order_id).execute()
-        return len(response.data) > 0
-    
-    # ADMIN
+        resp = _db().table("orders").update({"status": status}).eq("id", order_id).execute()
+        return len(resp.data) > 0
+
+    # ── ADMIN ──────────────────────────────────────
+
     @staticmethod
     def get_all_orders() -> list:
-        response = _get_client().table("orders").select("*").order("id", desc=True).limit(50).execute()
-        orders = response.data
+        resp = _db().table("orders").select("*").order("id", desc=True).limit(50).execute()
+        orders = resp.data
         for o in orders:
-            customer = _get_client().table("customers").select("name").eq("id", o["customer_id"]).execute()
-            o["customer_name"] = customer.data[0]["name"] if customer.data else "—"
+            c = _db().table("customers").select("name").eq("id", o["customer_id"]).execute()
+            o["customer_name"] = c.data[0]["name"] if c.data else "—"
         return orders
-    
+
     @staticmethod
     def get_admin_stats() -> dict:
-        orders = _get_client().table("orders").select("*").execute()
-        customers = _get_client().table("customers").select("id", count="exact").execute()
-        products = _get_client().table("products").select("id", count="exact").execute()
-        
+        orders = _db().table("orders").select("*").execute()
+        customers = _db().table("customers").select("id", count="exact").execute()
+        products = _db().table("products").select("id", count="exact").execute()
         total_revenue = sum(o.get("total", 0) for o in orders.data if o.get("status") != "cancelled")
         pending = sum(1 for o in orders.data if o.get("status") == "pending")
-        
         return {
             "total_orders": len(orders.data),
             "pending_orders": pending,
-            "total_customers": customers.count if hasattr(customers, 'count') else len(customers.data),
-            "total_products": products.count if hasattr(products, 'count') else len(products.data),
+            "total_customers": getattr(customers, 'count', len(customers.data)),
+            "total_products": getattr(products, 'count', len(products.data)),
             "total_revenue": round(total_revenue, 2),
         }

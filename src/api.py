@@ -1,299 +1,177 @@
 import os
-from fastapi import FastAPI, Request, Response, HTTPException, Query
+import hashlib
+from fastapi import FastAPI, Request, Response, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from twilio.twiml.messaging_response import MessagingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
-from fastapi import Depends
 
-from .handlers.whatsapp import whatsapp_handler
 from .config import settings
 
 security = HTTPBasic()
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, os.getenv("ADMIN_USER", "admin"))
-    correct_password = secrets.compare_digest(credentials.password, os.getenv("ADMIN_PASSWORD", "changeme"))
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    if not settings.ADMIN_USER or not settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Admin not configured. Set ADMIN_USER and ADMIN_PASSWORD env vars.")
+    user_ok = secrets.compare_digest(credentials.username, settings.ADMIN_USER)
+    pass_ok = secrets.compare_digest(
+        hashlib.sha256(credentials.password.encode()).hexdigest(),
+        hashlib.sha256(settings.ADMIN_PASSWORD.encode()).hexdigest()
+    )
+    if not (user_ok and pass_ok):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-app = FastAPI(title="Bot Multi-plataforma")
+app = FastAPI(title="Bot Tienda")
 
-# CORS restringido a orígenes configurados
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
-if not CORS_ORIGINS or CORS_ORIGINS == [""]:
-    CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
-
+CORS_ORIGINS = settings.CORS_ORIGINS or ["http://localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
 
-# Modelo para mensajes web
 class WebMessage(BaseModel):
     message: str
     user_id: str
-    platform: str  # "web", "whatsapp", etc.
+    platform: str = "web"
 
-# Endpoint para WhatsApp/Twilio
-@app.post("/whatsapp/webhook")
-async def whatsapp_webhook(request: Request):
-    try:
-        form = await request.form()
-        phone = form.get("From", "").replace("whatsapp:", "")
-        message = form.get("Body", "")
-        
-        response_text = await whatsapp_handler.handle_message(phone, message)
-        
-        twiml = MessagingResponse()
-        twiml.message(response_text)
-        
-        return Response(content=str(twiml), media_type="application/xml")
-    except Exception:
-        twiml = MessagingResponse()
-        twiml.message("Error interno. Intente más tarde.")
-        return Response(content=str(twiml), media_type="application/xml")
+# ── WhatsApp webhook (solo si TWILIO configurado) ──
+if settings.WHATSAPP_ENABLED:
+    from twilio.twiml.messaging_response import MessagingResponse
+    from .handlers.whatsapp import whatsapp_handler
 
-# Endpoint para chat web
+    @app.post("/whatsapp/webhook")
+    async def whatsapp_webhook(request: Request):
+        try:
+            form = await request.form()
+            phone = form.get("From", "").replace("whatsapp:", "")
+            text = form.get("Body", "")
+            resp = await whatsapp_handler.handle_message(phone, text)
+            twiml = MessagingResponse()
+            twiml.message(resp)
+            return Response(content=str(twiml), media_type="application/xml")
+        except Exception:
+            twiml = MessagingResponse()
+            twiml.message("Error interno.")
+            return Response(content=str(twiml), media_type="application/xml")
+
+# ── Web chat (usa WhatsAppHandler, funciona sin Twilio) ──
+from .handlers.whatsapp import whatsapp_handler
+
 @app.post("/web/chat")
-async def web_chat(message_data: WebMessage):
+async def web_chat(data: WebMessage):
     try:
-        response_text = await whatsapp_handler.handle_message(
-            message_data.user_id, 
-            message_data.message
-        )
-        return {"response": response_text}
+        resp = await whatsapp_handler.handle_message(data.user_id, data.message)
+        return {"response": resp}
     except Exception:
-        raise HTTPException(status_code=500, detail="Error al procesar mensaje")
+        raise HTTPException(status_code=500, detail="Error")
 
-# Endpoint para obtener productos (API pública)
+# ── API pública ──
 @app.get("/api/products")
 async def get_products(category: Optional[str] = None):
+    from .services.database import DatabaseService
     try:
-        from .services.database import DatabaseService
-        products = DatabaseService.get_products(category=category)
-        return [p.model_dump() for p in products]
+        return [p.model_dump() for p in DatabaseService.get_products(category=category)]
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error al obtener productos")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================
-# Admin Dashboard (HTML)
-# ============================================
-ADMIN_HTML = """
-<!DOCTYPE html>
+# ── Admin Dashboard ──
+ADMIN_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Panel Admin - Bot Tienda</title>
+    <title>Panel Admin</title>
     <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }}
-        .header {{ background: #1a1a2e; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }}
-        .header h1 {{ font-size: 1.5rem; }}
-        .container {{ max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }}
-        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
-        .stat-card {{ background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .stat-card h3 {{ font-size: 0.875rem; color: #666; margin-bottom: 0.5rem; }}
-        .stat-card .value {{ font-size: 2rem; font-weight: bold; color: #1a1a2e; }}
-        .card {{ background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 1.5rem; overflow: hidden; }}
-        .card-header {{ padding: 1rem 1.5rem; border-bottom: 1px solid #eee; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }}
-        .card-body {{ padding: 1.5rem; overflow-x: auto; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th, td {{ text-align: left; padding: 0.75rem; border-bottom: 1px solid #eee; font-size: 0.875rem; }}
-        th {{ color: #666; font-weight: 600; }}
-        .badge {{ display: inline-block; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }}
-        .badge-pending {{ background: #fff3cd; color: #856404; }}
-        .badge-confirmed {{ background: #cce5ff; color: #004085; }}
-        .badge-preparing {{ background: #d4edda; color: #155724; }}
-        .badge-ready {{ background: #d4edda; color: #155724; }}
-        .badge-delivered {{ background: #cce5ff; color: #004085; }}
-        .badge-cancelled {{ background: #f8d7da; color: #721c24; }}
-        .btn {{ display: inline-block; padding: 0.375rem 0.75rem; border-radius: 4px; border: none; cursor: pointer; font-size: 0.8rem; text-decoration: none; }}
-        .btn-primary {{ background: #1a1a2e; color: white; }}
-        .btn-danger {{ background: #dc3545; color: white; }}
-        .btn-sm {{ padding: 0.25rem 0.5rem; font-size: 0.75rem; }}
-        .loading {{ text-align: center; padding: 2rem; color: #666; }}
-        .error {{ color: #721c24; background: #f8d7da; padding: 1rem; border-radius: 4px; }}
-        .actions {{ display: flex; gap: 0.5rem; }}
-        select {{ padding: 0.25rem; border-radius: 4px; border: 1px solid #ccc; }}
-        @media (max-width: 768px) {{ .stats {{ grid-template-columns: 1fr 1fr; }} }}
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f5f5;color:#333}
+        .header{background:#1a1a2e;color:#fff;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
+        .container{max-width:1200px;margin:2rem auto;padding:0 1rem}
+        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:2rem}
+        .stat-card{background:#fff;padding:1.5rem;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+        .stat-card h3{font-size:.875rem;color:#666;margin-bottom:.5rem}
+        .stat-card .value{font-size:2rem;font-weight:700;color:#1a1a2e}
+        .card{background:#fff;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1);margin-bottom:1.5rem;overflow:hidden}
+        .card-header{padding:1rem 1.5rem;border-bottom:1px solid #eee;font-weight:600;display:flex;justify-content:space-between}
+        .card-body{padding:1.5rem;overflow-x:auto}
+        table{width:100%;border-collapse:collapse}
+        th,td{text-align:left;padding:.75rem;border-bottom:1px solid #eee;font-size:.875rem}
+        th{color:#666;font-weight:600}
+        .badge{display:inline-block;padding:.25rem .5rem;border-radius:4px;font-size:.75rem;font-weight:600}
+        .badge-pending{background:#fff3cd;color:#856404}
+        .badge-confirmed{background:#cce5ff;color:#004085}
+        .badge-preparing,.badge-ready,.badge-delivered{background:#d4edda;color:#155724}
+        .badge-cancelled{background:#f8d7da;color:#721c24}
+        .btn{display:inline-block;padding:.375rem .75rem;border-radius:4px;border:none;cursor:pointer;font-size:.8rem}
+        .btn-primary{background:#1a1a2e;color:#fff}
+        .loading{text-align:center;padding:2rem;color:#666}
+        .error{color:#721c24;background:#f8d7da;padding:1rem;border-radius:4px}
+        select{padding:.25rem;border-radius:4px;border:1px solid #ccc}
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>📊 Panel de Administración</h1>
-        <span id="refresh-time"></span>
+<div class="header"><h1>📊 Panel Admin</h1><span id="refresh-time"></span></div>
+<div class="container">
+    <div class="stats" id="stats"></div>
+    <div class="card">
+        <div class="card-header"><span>📦 Órdenes</span><button class="btn btn-primary" onclick="loadData()">↻</button></div>
+        <div class="card-body" id="orders-table"><div class="loading">Cargando...</div></div>
     </div>
-    <div class="container">
-        <div class="stats" id="stats"></div>
-        <div class="card">
-            <div class="card-header">
-                <span>📦 Órdenes Recientes</span>
-                <button class="btn btn-primary btn-sm" onclick="loadData()">↻ Actualizar</button>
-            </div>
-            <div class="card-body" id="orders-table"><div class="loading">Cargando...</div></div>
-        </div>
-        <div class="card">
-            <div class="card-header"><span>🛍 Productos</span></div>
-            <div class="card-body" id="products-table"><div class="loading">Cargando...</div></div>
-        </div>
+    <div class="card">
+        <div class="card-header"><span>🛍 Productos</span></div>
+        <div class="card-body" id="products-table"><div class="loading">Cargando...</div></div>
     </div>
-    <script>
-    function statusBadge(status) {
-        return `<span class="badge badge-${status}">${status}</span>`;
-    }
-
-    async function loadData() {
-        try {
-            const [statsRes, ordersRes, productsRes] = await Promise.all([
-                fetch('/admin/api/stats'),
-                fetch('/admin/api/orders'),
-                fetch('/admin/api/products')
-            ]);
-            const stats = await statsRes.json();
-            const orders = await ordersRes.json();
-            const products = await productsRes.json();
-
-            document.getElementById('refresh-time').textContent = new Date().toLocaleString();
-
-            // Stats
-            document.getElementById('stats').innerHTML = `
-                <div class="stat-card"><h3>Órdenes Totales</h3><div class="value">${stats.total_orders}</div></div>
-                <div class="stat-card"><h3>Pendientes</h3><div class="value">${stats.pending_orders}</div></div>
-                <div class="stat-card"><h3>Clientes</h3><div class="value">${stats.total_customers}</div></div>
-                <div class="stat-card"><h3>Productos</h3><div class="value">${stats.total_products}</div></div>
-                <div class="stat-card"><h3>Ingresos Totales</h3><div class="value">$${stats.total_revenue}</div></div>
-            `;
-
-            // Orders
-            if (orders.length === 0) {
-                document.getElementById('orders-table').innerHTML = '<p>No hay órdenes aún.</p>';
-            } else {
-                document.getElementById('orders-table').innerHTML = `
-                    <table>
-                        <thead><tr>
-                            <th>ID</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Fecha</th><th>Acción</th>
-                        </tr></thead>
-                        <tbody>${orders.map(o => `
-                            <tr>
-                                <td>#${o.id}</td>
-                                <td>${o.customer_name || '—'}</td>
-                                <td>$${o.total}</td>
-                                <td>${statusBadge(o.status)}</td>
-                                <td>${new Date(o.created_at).toLocaleDateString()}</td>
-                                <td>
-                                    <select onchange="updateOrder(${o.id}, this.value)" class="btn-sm">
-                                        <option value="">Cambiar estado</option>
-                                        <option value="confirmed">Confirmar</option>
-                                        <option value="preparing">Preparando</option>
-                                        <option value="ready">Listo</option>
-                                        <option value="delivered">Entregado</option>
-                                        <option value="cancelled">Cancelar</option>
-                                    </select>
-                                </td>
-                            </tr>
-                        `).join('')}</tbody>
-                    </table>
-                `;
-            }
-
-            // Products
-            if (products.length === 0) {
-                document.getElementById('products-table').innerHTML = '<p>No hay productos.</p>';
-            } else {
-                document.getElementById('products-table').innerHTML = `
-                    <table>
-                        <thead><tr>
-                            <th>ID</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th><th>Activo</th>
-                        </tr></thead>
-                        <tbody>${products.map(p => `
-                            <tr>
-                                <td>${p.id}</td>
-                                <td>${p.name}</td>
-                                <td>$${p.price}</td>
-                                <td>${p.stock}</td>
-                                <td>${p.category || '—'}</td>
-                                <td>${p.active ? '✅' : '❌'}</td>
-                            </tr>
-                        `).join('')}</tbody>
-                    </table>
-                `;
-            }
-        } catch (err) {
-            document.getElementById('orders-table').innerHTML = '<div class="error">Error al cargar datos. ¿El servidor está corriendo?</div>';
-            document.getElementById('products-table').innerHTML = '';
-        }
-    }
-
-    async function updateOrder(orderId, status) {
-        if (!status) return;
-        try {
-            const res = await fetch('/admin/api/orders/' + orderId + '/status', {
-                method: 'PATCH',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({status})
-            });
-            if (res.ok) loadData();
-            else alert('Error al actualizar');
-        } catch (err) {
-            alert('Error de conexión');
-        }
-    }
-
-    loadData();
-    setInterval(loadData, 30000);
-    </script>
+</div>
+<script>
+async function loadData(){try{
+const[s,r,p]=await Promise.all([fetch('/admin/api/stats'),fetch('/admin/api/orders'),fetch('/admin/api/products')]);
+if(s.status===401||s.status===503){document.getElementById('orders-table').innerHTML='<div class=\\"error\\">No autorizado o no configurado</div>';return}
+const stats=await s.json(),orders=await r.json(),products=await p.json();
+document.getElementById('refresh-time').textContent=new Date().toLocaleString();
+document.getElementById('stats').innerHTML=`
+<div class=\\"stat-card\\"><h3>Órdenes</h3><div class=\\"value\\">${stats.total_orders}</div></div>
+<div class=\\"stat-card\\"><h3>Pendientes</h3><div class=\\"value\\">${stats.pending_orders}</div></div>
+<div class=\\"stat-card\\"><h3>Clientes</h3><div class=\\"value\\">${stats.total_customers}</div></div>
+<div class=\\"stat-card\\"><h3>Productos</h3><div class=\\"value\\">${stats.total_products}</div></div>
+<div class=\\"stat-card\\"><h3>Ingresos</h3><div class=\\"value\\">$${stats.total_revenue}</div></div>`;
+var h='<table><thead><tr><th>ID</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>';
+orders.forEach(o=>{h+=`<tr><td>#${o.id}</td><td>${o.customer_name||'—'}</td><td>$${o.total}</td><td><span class=\\"badge badge-${o.status}\\">${o.status}</span></td><td>${new Date(o.created_at).toLocaleDateString()}</td></tr>`});
+document.getElementById('orders-table').innerHTML=h+'</tbody></table>';
+h='<table><thead><tr><th>ID</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th></tr></thead><tbody>';
+products.forEach(p=>{h+=`<tr><td>${p.id}</td><td>${p.name}</td><td>$${p.price}</td><td>${p.stock}</td><td>${p.category||'—'}</td></tr>`});
+document.getElementById('products-table').innerHTML=h+'</tbody></table>';
+}catch(e){document.getElementById('orders-table').innerHTML='<div class=\\"error\\">Error de conexión</div>'}}
+loadData();setInterval(loadData,30000);
+</script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
-    verify_admin(credentials)
+async def admin_dashboard(_: HTTPBasicCredentials = Depends(security)):
+    verify_admin(_)
     return ADMIN_HTML
 
-# Admin API endpoints
 @app.get("/admin/api/stats")
-async def admin_stats(credentials: HTTPBasicCredentials = Depends(security)):
-    verify_admin(credentials)
+async def admin_stats(_: HTTPBasicCredentials = Depends(security)):
+    verify_admin(_)
     from .services.database import DatabaseService
     return DatabaseService.get_admin_stats()
 
 @app.get("/admin/api/orders")
-async def admin_orders(credentials: HTTPBasicCredentials = Depends(security)):
-    verify_admin(credentials)
+async def admin_orders(_: HTTPBasicCredentials = Depends(security)):
+    verify_admin(_)
     from .services.database import DatabaseService
     return DatabaseService.get_all_orders()
 
 @app.get("/admin/api/products")
-async def admin_products(credentials: HTTPBasicCredentials = Depends(security)):
-    verify_admin(credentials)
+async def admin_products(_: HTTPBasicCredentials = Depends(security)):
+    verify_admin(_)
     from .services.database import DatabaseService
     return [p.model_dump() for p in DatabaseService.get_products(active_only=False)]
-
-@app.patch("/admin/api/orders/{order_id}/status")
-async def admin_update_order_status(order_id: int, data: dict, credentials: HTTPBasicCredentials = Depends(security)):
-    verify_admin(credentials)
-    from .services.database import DatabaseService
-    status = data.get("status")
-    if status not in ("pending", "confirmed", "preparing", "ready", "delivered", "cancelled"):
-        raise HTTPException(status_code=400, detail="Estado inválido")
-    success = DatabaseService.update_order_status(order_id, status)
-    if not success:
-        raise HTTPException(status_code=404, detail="Orden no encontrada")
-    return {"ok": True}
 
 if __name__ == "__main__":
     import uvicorn

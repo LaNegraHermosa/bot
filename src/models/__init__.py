@@ -22,7 +22,7 @@ class Order(BaseModel):
     id: Optional[int] = None
     customer_id: int
     total: float
-    status: str  # pending, confirmed, preparing, ready, delivered, cancelled
+    status: str
     notes: Optional[str] = None
 
 class OrderItem(BaseModel):
@@ -30,7 +30,7 @@ class OrderItem(BaseModel):
     order_id: int
     product_id: int
     quantity: int
-    price: float  # Precio al momento de la orden
+    price: float
 
 class CartItem(BaseModel):
     product_id: int
